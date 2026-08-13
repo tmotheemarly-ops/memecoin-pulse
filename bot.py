@@ -10,12 +10,20 @@ NEW_PAIR_MAX_AGE_MIN = 30
 NEW_PAIR_MIN_LIQUIDITY = 5000
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/markets"
+COINGECKO_MARKETS_URL = "https://api.coingecko.com/api/v3/coins/markets"
+COINGECKO_DETAIL_URL = "https://api.coingecko.com/api/v3/coins/{id}"
 DEXSCREENER_URL = "https://api.dexscreener.com/latest/dex/search"
 GOPLUS_EVM_URL = "https://api.gopluslabs.io/api/v1/token_security/{chain_id}"
 GOPLUS_SOLANA_URL = "https://api.gopluslabs.io/api/v1/solana/token_security"
 
-CHAIN_IDS = {"ethereum": "1", "bsc": "56", "polygon": "137", "arbitrum": "42161", "base": "8453"}
+PLATFORM_TO_GOPLUS = {
+    "ethereum": "1", "binance-smart-chain": "56", "polygon-pos": "137",
+    "arbitrum-one": "42161", "base": "8453", "solana": "solana",
+}
+
+
+def jupiter_link(output_mint):
+    return f"https://jup.ag/swap/SOL-{output_mint}"
 
 
 def send_telegram(text):
@@ -28,55 +36,7 @@ def clamp(v, lo=0, hi=100):
     return max(lo, min(hi, v))
 
 
-# ---------------- Momentum tracker (established coins) ----------------
-def fetch_coins():
-    params = {
-        "vs_currency": "usd", "order": "volume_desc", "per_page": 50,
-        "page": 1, "category": "meme-token", "price_change_percentage": "1h,24h,7d",
-    }
-    r = requests.get(COINGECKO_URL, params=params, timeout=20)
-    r.raise_for_status()
-    return r.json()
-
-
-def momentum_score(c):
-    chg_1h = c.get("price_change_percentage_1h_in_currency") or 0
-    chg_24h = c.get("price_change_percentage_24h_in_currency") or 0
-    chg_7d = c.get("price_change_percentage_7d_in_currency") or 0
-    mc = c.get("market_cap") or 0
-    vol = c.get("total_volume") or 0
-    vol_ratio = (vol / mc) if mc else 0
-
-    short_term = clamp((chg_1h + 10) / 20 * 100)
-    daily = clamp((chg_24h + 30) / 60 * 100)
-    weekly = clamp((chg_7d + 60) / 120 * 100)
-    liquidity = clamp(vol_ratio * 100)
-
-    score = short_term * 0.25 + daily * 0.35 + weekly * 0.15 + liquidity * 0.25
-    return round(score), {"1h": chg_1h, "24h": chg_24h, "7d": chg_7d, "vol_ratio": vol_ratio, "rank": c.get("market_cap_rank")}
-
-
-def check_momentum():
-    for c in fetch_coins():
-        score, d = momentum_score(c)
-        if score < MOMENTUM_THRESHOLD:
-            continue
-        price = c.get("current_price") or 0
-        price_str = f"${price:.8f}" if price < 0.01 else f"${price:,.4f}"
-        msg = (
-            f"🚨 *{c['symbol'].upper()}* — momentum {score}/100\n"
-            f"Price: {price_str} (rank #{d['rank']})\n"
-            f"1h: {d['1h']:+.2f}% · 24h: {d['24h']:+.2f}% · 7d: {d['7d']:+.2f}%\n"
-            f"Volume/MCap turnover: {d['vol_ratio']:.2f}\n"
-            f"⚠️ Heuristic only. Not a prediction, not advice. DYOR."
-        )
-        send_telegram(msg)
-        print("momentum alert", c["id"], score)
-
-
-# ---------------- Contract security check (GoPlus) ----------------
 def check_contract_security(chain_id, contract_address):
-    """Returns (risk_score 0-100 higher=riskier, list of red flags)."""
     try:
         if chain_id == "solana":
             r = requests.get(GOPLUS_SOLANA_URL, params={"contract_addresses": contract_address}, timeout=15)
@@ -133,7 +93,90 @@ def check_contract_security(chain_id, contract_address):
     return min(risk, 100), flags
 
 
-# ---------------- New pair detection ----------------
+def get_contract_info(coin_id):
+    try:
+        r = requests.get(COINGECKO_DETAIL_URL.format(id=coin_id), timeout=15)
+        r.raise_for_status()
+        platforms = r.json().get("platforms", {}) or {}
+    except Exception as e:
+        print("coingecko detail error", e)
+        return None, None
+
+    for platform, address in platforms.items():
+        if platform in PLATFORM_TO_GOPLUS and address:
+            return PLATFORM_TO_GOPLUS[platform], address
+    return None, None
+
+
+def risk_label_for(score):
+    if score is None:
+        return "⚪ UNKNOWN"
+    if score >= 50:
+        return "🔴 HIGH"
+    if score >= 20:
+        return "🟡 MEDIUM"
+    return "🟢 LOWER (still no guarantee)"
+
+
+def fetch_coins():
+    params = {
+        "vs_currency": "usd", "order": "volume_desc", "per_page": 50,
+        "page": 1, "category": "meme-token", "price_change_percentage": "1h,24h,7d",
+    }
+    r = requests.get(COINGECKO_MARKETS_URL, params=params, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+
+def momentum_score(c):
+    chg_1h = c.get("price_change_percentage_1h_in_currency") or 0
+    chg_24h = c.get("price_change_percentage_24h_in_currency") or 0
+    chg_7d = c.get("price_change_percentage_7d_in_currency") or 0
+    mc = c.get("market_cap") or 0
+    vol = c.get("total_volume") or 0
+    vol_ratio = (vol / mc) if mc else 0
+
+    short_term = clamp((chg_1h + 10) / 20 * 100)
+    daily = clamp((chg_24h + 30) / 60 * 100)
+    weekly = clamp((chg_7d + 60) / 120 * 100)
+    liquidity = clamp(vol_ratio * 100)
+
+    score = short_term * 0.25 + daily * 0.35 + weekly * 0.15 + liquidity * 0.25
+    return round(score), {"1h": chg_1h, "24h": chg_24h, "7d": chg_7d, "vol_ratio": vol_ratio, "rank": c.get("market_cap_rank")}
+
+
+def check_momentum():
+    for c in fetch_coins():
+        score, d = momentum_score(c)
+        if score < MOMENTUM_THRESHOLD:
+            continue
+
+        price = c.get("current_price") or 0
+        price_str = f"${price:.8f}" if price < 0.01 else f"${price:,.4f}"
+
+        chain_id, contract = get_contract_info(c["id"])
+        risk_score, flags = (None, ["contract not found on supported chains"])
+        if chain_id and contract:
+            risk_score, flags = check_contract_security(chain_id, contract)
+        risk_text = "\n".join(f"  {f}" for f in flags)
+
+        msg = (
+            f"🚨 *{c['symbol'].upper()}* — momentum {score}/100\n"
+            f"Price: {price_str} (rank #{d['rank']})\n"
+            f"1h: {d['1h']:+.2f}% · 24h: {d['24h']:+.2f}% · 7d: {d['7d']:+.2f}%\n"
+            f"Volume/MCap turnover: {d['vol_ratio']:.2f}\n\n"
+            f"*Contract risk: {risk_label_for(risk_score)}*\n{risk_text}\n\n"
+            f"⚠️ Heuristic + public contract data only. Not a prediction, not advice. "
+            f"A low risk score does not mean safe. DYOR."
+        )
+
+        if chain_id == "solana" and contract:
+            msg += f"\n\n🔗 [Open swap in Jupiter]({jupiter_link(contract)})"
+
+        send_telegram(msg)
+        print("momentum alert", c["id"], score, risk_score)
+
+
 def check_new_pairs():
     try:
         r = requests.get(DEXSCREENER_URL, params={"q": "meme"}, timeout=20)
@@ -168,15 +211,6 @@ def check_new_pairs():
         if goplus_chain and contract:
             risk_score, flags = check_contract_security(goplus_chain, contract)
 
-        risk_label = "UNKNOWN"
-        if risk_score is not None:
-            if risk_score >= 50:
-                risk_label = "🔴 HIGH"
-            elif risk_score >= 20:
-                risk_label = "🟡 MEDIUM"
-            else:
-                risk_label = "🟢 LOWER (still new/unproven)"
-
         flags_text = "\n".join(f"  {f}" for f in flags)
 
         msg = (
@@ -184,11 +218,14 @@ def check_new_pairs():
             f"Liquidity: ${liquidity_usd:,.0f} · 5m volume: ${vol_5m:,.0f}\n"
             f"5m price change: {price_change_5m:+.2f}%\n"
             f"Chain: {chain} · DEX: {p.get('dexId','?')}\n\n"
-            f"*Contract risk: {risk_label}*\n{flags_text}\n\n"
+            f"*Contract risk: {risk_label_for(risk_score)}*\n{flags_text}\n\n"
             f"⚠️ This is a public-data risk read, not a recommendation. "
-            f"A low risk score does not mean safe — it means fewer detected red flags. "
-            f"Always verify independently before any transaction."
+            f"A low risk score does not mean safe. DYOR."
         )
+
+        if chain == "solana" and contract:
+            msg += f"\n\n🔗 [Open swap in Jupiter]({jupiter_link(contract)})"
+
         send_telegram(msg)
         print("new pair alert", base.get("symbol"), age_min, risk_score)
 
